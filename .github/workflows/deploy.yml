@@ -3,8 +3,9 @@ name: Deploy to Server
 on:
   push:
     branches:
-      - main
-      - master
+      - main      # Продакшн (порт 80)
+      - master    # Продакшн (порт 80)
+      - dev       # Тест (порт 9000)
   workflow_dispatch:
     inputs:
       site_name:
@@ -44,14 +45,22 @@ jobs:
           # pytest tests/ || true
           echo "Tests skipped for now"
 
-      - name: Determine site name
+      - name: Determine site name and environment
         id: site
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "name=${{ github.event.inputs.site_name }}" >> $GITHUB_OUTPUT
+            echo "env=prod" >> $GITHUB_OUTPUT
           else
-            # Default site name from branch or env
-            echo "name=boofmebel" >> $GITHUB_OUTPUT
+            # Определяем окружение по ветке
+            BRANCH="${{ github.ref_name }}"
+            if [ "$BRANCH" == "dev" ]; then
+              echo "name=boofmebel-test" >> $GITHUB_OUTPUT
+              echo "env=test" >> $GITHUB_OUTPUT
+            else
+              echo "name=boofmebel" >> $GITHUB_OUTPUT
+              echo "env=prod" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Deploy to server
@@ -63,12 +72,32 @@ jobs:
           script: |
             set -e
             SITE_NAME="${{ steps.site.outputs.name }}"
-            echo "🚀 Deploying to site: ${SITE_NAME}"
+            ENV="${{ steps.site.outputs.env }}"
+            BRANCH="${{ github.ref_name }}"
+            echo "🚀 Deploying to site: ${SITE_NAME} (${ENV})"
+            echo "   Branch: ${BRANCH}"
+            
+            # Проверяем существует ли директория, если нет - создаём базовую структуру
+            if [ ! -d "/var/www/${SITE_NAME}" ]; then
+              echo "⚠️  Directory /var/www/${SITE_NAME} not found!"
+              echo "   Creating basic structure..."
+              sudo mkdir -p /var/www/${SITE_NAME}
+              sudo chown -R ${{ secrets.SERVER_USER }}:${{ secrets.SERVER_USER }} /var/www/${SITE_NAME}
+              
+              # Клонируем репозиторий если его нет
+              if [ ! -d "/var/www/${SITE_NAME}/.git" ]; then
+                echo "   Cloning repository..."
+                cd /var/www/${SITE_NAME}
+                git clone ${{ github.repositoryUrl }} .
+                git checkout ${BRANCH}
+              fi
+            fi
+            
             cd /var/www/${SITE_NAME}
             
-            # Pull latest code
+            # Pull latest code from current branch
             git fetch origin
-            git reset --hard origin/main || git reset --hard origin/master
+            git reset --hard origin/${BRANCH}
             
             # Activate venv or create if not exists
             if [ ! -d "venv" ]; then
@@ -83,11 +112,22 @@ jobs:
             # Run migrations
             alembic upgrade head
             
-            # Restart service
-            sudo systemctl restart ${SITE_NAME}.service || echo "Service not found, skipping restart"
+            # Restart service (если существует)
+            if sudo systemctl is-active --quiet ${SITE_NAME}.service 2>/dev/null; then
+              sudo systemctl restart ${SITE_NAME}.service
+              echo "✅ Service ${SITE_NAME} restarted"
+            else
+              echo "⚠️  Service ${SITE_NAME}.service not found"
+              echo "   Run './deploy/setup.sh ${SITE_NAME} <domain> ${ENV}' to create it"
+            fi
             
             # Reload nginx
             sudo systemctl reload nginx || echo "Nginx reload failed"
             
             echo "✅ Deployment completed successfully for ${SITE_NAME}!"
+            if [ "$ENV" = "test" ]; then
+              echo "🌐 Test server: http://${{ secrets.SERVER_HOST }}:9000"
+            else
+              echo "🌐 Production server: http://${{ secrets.SERVER_HOST }}"
+            fi
 

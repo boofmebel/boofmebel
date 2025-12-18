@@ -1,15 +1,33 @@
 #!/bin/bash
 # Setup script for deploying BoofMebel to server
-# Usage: ./deploy/setup.sh <site_name> <domain>
+# Usage: ./deploy/setup.sh <site_name> <domain> [prod|test]
+#   prod - продакшн на порту 80 (по умолчанию)
+#   test - тест на порту 9000
 
 set -e
 
 SITE_NAME=${1:-boofmebel}
 DOMAIN=${2:-boofmebel.example.com}
+ENV=${3:-prod}  # prod или test
 APP_DIR="/var/www/${SITE_NAME}"
 SERVICE_NAME="${SITE_NAME}"
 
-echo "🚀 Setting up ${SITE_NAME} at ${DOMAIN}"
+# Порты по окружениям (как в MarketAI)
+if [ "$ENV" = "test" ]; then
+    GUNICORN_PORT=9000  # Gunicorn слушает на 9000
+    NGINX_PORT=9000     # Nginx тоже на 9000
+    ENV_SUFFIX="-test"
+    SERVICE_NAME="${SITE_NAME}${ENV_SUFFIX}"
+    APP_DIR="/var/www/${SITE_NAME}-test"
+else
+    GUNICORN_PORT=8000  # Gunicorn слушает на 8000 (внутренний)
+    NGINX_PORT=80       # Nginx на 80 (внешний)
+    ENV_SUFFIX=""
+fi
+
+echo "🚀 Setting up ${SITE_NAME} at ${DOMAIN} (${ENV})"
+echo "   Gunicorn порт: ${GUNICORN_PORT}"
+echo "   Nginx порт: ${NGINX_PORT}"
 
 # Create app directory
 sudo mkdir -p ${APP_DIR}
@@ -68,7 +86,7 @@ Environment="PATH=${APP_DIR}/venv/bin"
 ExecStart=${APP_DIR}/venv/bin/gunicorn app.main:app \
     --workers 4 \
     --worker-class uvicorn.workers.UvicornWorker \
-    --bind 127.0.0.1:8000 \
+    --bind 127.0.0.1:${GUNICORN_PORT} \
     --timeout 120 \
     --access-logfile ${APP_DIR}/logs/access.log \
     --error-logfile ${APP_DIR}/logs/error.log
@@ -91,10 +109,71 @@ echo "✅ Service ${SERVICE_NAME} created and started!"
 
 # Create Nginx config
 echo "🌐 Creating Nginx configuration..."
-sudo tee /etc/nginx/sites-available/${SITE_NAME} > /dev/null << EOF
-# Upstream for ${SITE_NAME}
+NGINX_CONFIG="${SITE_NAME}${ENV_SUFFIX}"
+
+if [ "$ENV" = "test" ]; then
+    # Тестовое окружение - HTTP на порту 9000
+    sudo tee /etc/nginx/sites-available/${NGINX_CONFIG} > /dev/null << EOF
+# Upstream for ${SITE_NAME}${ENV_SUFFIX} (TEST)
+upstream ${SITE_NAME}${ENV_SUFFIX}_backend {
+    server 127.0.0.1:${GUNICORN_PORT};
+    keepalive 32;
+}
+
+# HTTP server for TEST environment (port 9000)
+server {
+    listen ${NGINX_PORT};
+    listen [::]:9000;
+    server_name ${DOMAIN} _;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # Gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css text/xml text/javascript application/json application/javascript;
+
+    # Client body size limit
+    client_max_body_size 10M;
+
+    # Logs
+    access_log /var/log/nginx/${NGINX_CONFIG}_access.log;
+    error_log /var/log/nginx/${NGINX_CONFIG}_error.log;
+
+    # Proxy settings
+    location / {
+        proxy_pass http://${SITE_NAME}${ENV_SUFFIX}_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port 9000;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 120s;
+    }
+
+    # Static files
+    location /static/ {
+        alias ${APP_DIR}/static/;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+}
+EOF
+else
+    # Продакшн - HTTPS на порту 80/443
+    sudo tee /etc/nginx/sites-available/${NGINX_CONFIG} > /dev/null << EOF
+# Upstream for ${SITE_NAME} (PROD)
 upstream ${SITE_NAME}_backend {
-    server 127.0.0.1:8000;
+    server 127.0.0.1:${GUNICORN_PORT};
     keepalive 32;
 }
 
@@ -120,6 +199,10 @@ server {
     listen [::]:443 ssl http2;
     server_name ${DOMAIN};
 
+EOF
+    if [ "$ENV" = "prod" ]; then
+        # Добавить SSL конфигурацию для продакшна
+        sudo tee -a /etc/nginx/sites-available/${NGINX_CONFIG} > /dev/null << EOFSSL
     # SSL certificates (Let's Encrypt)
     ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
@@ -141,7 +224,18 @@ server {
 
     # CSP (adjust as needed)
     add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:;" always;
+EOFSSL
+    else
+        # Для теста - базовые security headers
+        sudo tee -a /etc/nginx/sites-available/${NGINX_CONFIG} > /dev/null << EOFTEST
+    # Security headers (test environment)
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+EOFTEST
+    fi
 
+    # Общая конфигурация для продакшна
+    sudo tee -a /etc/nginx/sites-available/${NGINX_CONFIG} > /dev/null << EOFCOMMON
     # Gzip compression
     gzip on;
     gzip_vary on;
@@ -156,8 +250,8 @@ server {
     client_max_body_size 10M;
 
     # Logs
-    access_log /var/log/nginx/${SITE_NAME}_access.log;
-    error_log /var/log/nginx/${SITE_NAME}_error.log;
+    access_log /var/log/nginx/${NGINX_CONFIG}_access.log;
+    error_log /var/log/nginx/${NGINX_CONFIG}_error.log;
 
     # Proxy settings
     location / {
@@ -186,7 +280,8 @@ server {
 EOF
 
 # Enable site
-sudo ln -sf /etc/nginx/sites-available/${SITE_NAME} /etc/nginx/sites-enabled/${SITE_NAME}
+NGINX_CONFIG="${SITE_NAME}${ENV_SUFFIX}"
+sudo ln -sf /etc/nginx/sites-available/${NGINX_CONFIG} /etc/nginx/sites-enabled/${NGINX_CONFIG}
 
 # Test Nginx config
 sudo nginx -t
@@ -194,8 +289,17 @@ sudo nginx -t
 echo "✅ Nginx configuration created!"
 echo ""
 echo "📋 Next steps:"
-echo "1. Install SSL certificate: sudo certbot --nginx -d ${DOMAIN}"
+if [ "$ENV" = "prod" ]; then
+    echo "1. Install SSL certificate: sudo certbot --nginx -d ${DOMAIN}"
+fi
 echo "2. Reload Nginx: sudo systemctl reload nginx"
 echo "3. Check service status: sudo systemctl status ${SERVICE_NAME}"
 echo "4. Check logs: sudo journalctl -u ${SERVICE_NAME} -f"
+echo ""
+echo "🌐 Доступ:"
+if [ "$ENV" = "test" ]; then
+    echo "   Тест: http://${SERVER_HOST:-localhost}:${NGINX_PORT}"
+else
+    echo "   Продакшн: http://${DOMAIN} (порт ${NGINX_PORT})"
+fi
 
