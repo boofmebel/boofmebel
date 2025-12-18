@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Alembic
+alembic.ini.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Static files (if served separately)
+static/uploads/
+static/media/
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Frontend (temporary, will be moved to Angular)
+node_modules/
+.next/
+out/
